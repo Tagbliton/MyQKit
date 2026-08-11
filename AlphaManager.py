@@ -15,25 +15,35 @@ DEFAULT_JSON_DIR = os.path.abspath("./strategies")
 CONFIG_FILE = os.path.abspath("./AlphaManager_config.json")
 
 
-def get_last_dir() -> str:
-    """读取上一次记录的目录路径"""
+def load_config() -> dict:
+    """读取配置文件"""
+    config = {
+        "last_dir": DEFAULT_JSON_DIR,
+        "theme": "light"
+    }
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                last_dir = data.get("last_dir")
-                if last_dir and os.path.exists(last_dir):
-                    return last_dir
+                if isinstance(data, dict):
+                    last_dir = data.get("last_dir")
+                    if last_dir and os.path.exists(last_dir):
+                        config["last_dir"] = last_dir
+                    theme = data.get("theme")
+                    if theme in ["light", "dark"]:
+                        config["theme"] = theme
         except Exception:
             pass
-    return DEFAULT_JSON_DIR
+    return config
 
 
-def save_last_dir(dir_path: str):
-    """保存上一次读取的目录路径"""
+def save_config(config_data: dict):
+    """保存配置信息（目录与主题）"""
     try:
+        current_config = load_config()
+        current_config.update(config_data)
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump({"last_dir": dir_path}, f, ensure_ascii=False, indent=2)
+            json.dump(current_config, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
@@ -43,7 +53,7 @@ app = FastAPI(title="量化 JSON 因子阅读器")
 # ==================== 前端 HTML / CSS / JS 模板 ====================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
-<html lang="zh-CN" data-theme="light">
+<html lang="zh-CN" data-theme="{{ theme }}">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -224,8 +234,8 @@ HTML_TEMPLATE = """
             </div>
         </div>
         <button class="theme-toggle-btn" onclick="toggleTheme()">
-            <span id="theme-icon">☀️</span>
-            <span id="theme-text">日间模式</span>
+            <span id="theme-icon">{% if theme == 'dark' %}🌙{% else %}☀️{% endif %}</span>
+            <span id="theme-text">{% if theme == 'dark' %}暗黑模式{% else %}日间模式{% endif %}</span>
         </button>
     </div>
 
@@ -351,19 +361,22 @@ HTML_TEMPLATE = """
     </div>
 
     <script>
-        // 初始化主题
-        function initTheme() {
-            const savedTheme = localStorage.getItem('theme') || 'light';
-            document.documentElement.setAttribute('data-theme', savedTheme);
-            updateThemeUI(savedTheme);
-        }
-
-        function toggleTheme() {
+        async function toggleTheme() {
             const currentTheme = document.documentElement.getAttribute('data-theme');
             const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
             document.documentElement.setAttribute('data-theme', newTheme);
-            localStorage.setItem('theme', newTheme);
             updateThemeUI(newTheme);
+
+            // 保存主题设置到后端的配置文件中
+            try {
+                await fetch('/api/save_theme', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ theme: newTheme })
+                });
+            } catch (e) {
+                console.error("保存主题属性配置失败", e);
+            }
         }
 
         function updateThemeUI(theme) {
@@ -618,7 +631,6 @@ HTML_TEMPLATE = """
         }
 
         window.onload = function() {
-            initTheme();
             filterAndSort();
         };
     </script>
@@ -628,6 +640,10 @@ HTML_TEMPLATE = """
 
 
 # ==================== Pydantic 请求结构 ====================
+class SaveThemeReq(BaseModel):
+    theme: str
+
+
 class SaveNoteReq(BaseModel):
     dir_path: str
     filename: str
@@ -655,12 +671,16 @@ class FileActionReq(BaseModel):
 
 @app.get("/", response_class=HTMLResponse)
 async def index(dir: Optional[str] = None):
-    # 如果 URL 传入了 dir，且存在，则更新记忆；否则使用上一次记录的路径
+    config = load_config()
+
+    # 如果 URL 传入了 dir，且存在，则更新记忆；否则使用配置中的路径
     if dir and os.path.exists(dir) and os.path.isdir(dir):
         target_dir = os.path.abspath(dir)
-        save_last_dir(target_dir)
+        save_config({"last_dir": target_dir})
     else:
-        target_dir = get_last_dir()
+        target_dir = config["last_dir"]
+
+    current_theme = config.get("theme", "light")
 
     items = []
     timeframes = set()
@@ -728,9 +748,18 @@ async def index(dir: Optional[str] = None):
     jinja_template = Template(HTML_TEMPLATE)
     return jinja_template.render(
         current_dir=target_dir,
+        theme=current_theme,
         items=items,
         timeframes=sorted(list(timeframes))
     )
+
+
+@app.post("/api/save_theme")
+async def save_theme(req: SaveThemeReq):
+    if req.theme not in ["light", "dark"]:
+        raise HTTPException(status_code=400, detail="非法的主题属性")
+    save_config({"theme": req.theme})
+    return {"status": "success"}
 
 
 @app.post("/api/save_note")
