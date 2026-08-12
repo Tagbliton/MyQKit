@@ -2,6 +2,7 @@ import sys
 import os
 import shutil
 import datetime
+from datetime import timedelta
 import pandas as pd
 import akshare as ak
 import pyqtgraph as pg
@@ -10,8 +11,8 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QLineEdit, QComboBox, QPushButton, QFileDialog, QStatusBar, QProgressBar, QMessageBox
 )
-from PyQt5.QtCore import QThread, pyqtSignal, QRectF, QPointF
-from PyQt5.QtGui import QColor, QPainter, QPicture
+from PyQt5.QtCore import QThread, pyqtSignal, QRectF, QPointF, QUrl
+from PyQt5.QtGui import QColor, QPainter, QPicture, QDesktopServices
 
 # 1. 强制清理代理环境变量，避免 ProxyError
 os.environ["HTTP_PROXY"] = ""
@@ -33,7 +34,6 @@ class CandlestickItem(pg.GraphicsObject):
     def generate_picture(self):
         p = QPainter(self.picture)
 
-        # 根据不同主题适配亮色/暗色环境下的涨跌颜色
         if self.is_dark:
             red_pen = pg.mkPen(color=QColor(255, 82, 82), width=1.2)
             red_brush = pg.mkBrush(QColor(255, 82, 82))
@@ -56,9 +56,7 @@ class CandlestickItem(pg.GraphicsObject):
                 p.setPen(green_pen)
                 p.setBrush(green_brush)
 
-            # 绘制上下影线
             p.drawLine(QPointF(x, low_p), QPointF(x, high_p))
-            # 绘制实体蜡烛棒
             p.drawRect(QRectF(x - w, open_p, w * 2, close_p - open_p))
 
         p.end()
@@ -102,44 +100,55 @@ class SinaDataExportThread(QThread):
         self.output_dir = output_dir
         self.save_to_file = save_to_file
 
+    def get_real_start_date(self, code, market):
+        """尝试获取股票的真实上市日期，失败则退回 19900101"""
+        if self.start_date != "19900101":
+            return self.start_date
+        try:
+            df_info = ak.stock_individual_info_em(symbol=code)
+            item = df_info[df_info['item'] == '上市时间']
+            if not item.empty:
+                val = str(item['value'].values[0]).replace("-", "").strip()
+                if len(val) == 8:
+                    return val
+        except Exception:
+            pass
+        return "19900101"
+
     def run(self):
         try:
-            # 1. 规范化输入：支持 "." 或 "," 分隔，转换为大写
             clean_symbol = self.symbol.replace(",", ".").upper().strip()
 
-            # 解析代码与市场（例如 "000001.SH" -> code="000001", market="SH"）
             if "." in clean_symbol:
                 code, market = clean_symbol.split(".", 1)
                 full_symbol = f"{market.lower()}{code}"
             else:
-                # 兼容未输入市场的旧格式（默认判定逻辑）
                 code = clean_symbol
-                prefix = "sz" if code.startswith(("00", "30", "20")) else "sh"
+                prefix = "sz" if code.startswith(("00", "30", "20", "39")) else "sh"
                 full_symbol = f"{prefix}{code}"
+                market = prefix.upper()
 
-            # 2. 根据 full_symbol 判断是指数还是普通股票
-            is_index = (full_symbol == "sh000001")  # 上证指数特殊处理
+            is_index = full_symbol.startswith(("sh000", "sz399", "sh000300"))
+            actual_start_date = self.get_real_start_date(code, market)
 
             if self.period == "1天":
                 if is_index:
-                    # 调用指数日线接口
                     df = ak.stock_zh_index_daily(symbol=full_symbol)
                     if df is not None and not df.empty:
                         df['date'] = pd.to_datetime(df['date'])
-                        start_dt = pd.to_datetime(self.start_date)
+                        start_dt = pd.to_datetime(actual_start_date)
                         end_dt = pd.to_datetime(self.end_date)
                         df = df[(df['date'] >= start_dt) & (df['date'] <= end_dt)].copy()
                 else:
-                    # 调用普通 A股 日线接口
                     df = ak.stock_zh_a_daily(
                         symbol=full_symbol,
-                        start_date=self.start_date,
+                        start_date=actual_start_date,
                         end_date=self.end_date,
                         adjust=self.adjust
                     )
 
                 if df is None or df.empty:
-                    self.finished_signal.emit(False, "未获取到数据，请检查股票代码或日期范围", None)
+                    self.finished_signal.emit(False, "未获取到数据，请检查代码或日期范围", None)
                     return
 
                 dt_series = pd.to_datetime(df['date']).dt.tz_localize('Asia/Shanghai')
@@ -158,7 +167,6 @@ class SinaDataExportThread(QThread):
                 })
 
             else:
-                # 分钟线数据逻辑（ak.stock_zh_a_minute 同时支持指数与股票）
                 min_period_map = {
                     "5分钟": "5",
                     "15分钟": "15",
@@ -169,17 +177,17 @@ class SinaDataExportThread(QThread):
                 df = ak.stock_zh_a_minute(symbol=full_symbol, period=k_period, adjust=self.adjust)
 
                 if df is None or df.empty:
-                    self.finished_signal.emit(False, "未获取到新浪分钟数据，请检查网络或代码", None)
+                    self.finished_signal.emit(False, "未获取到分钟数据，请检查网络或代码", None)
                     return
 
                 df['day'] = pd.to_datetime(df['day'])
-                start_dt = pd.to_datetime(self.start_date)
+                start_dt = pd.to_datetime(actual_start_date)
                 end_dt = pd.to_datetime(self.end_date) + pd.Timedelta(days=1)
 
                 df = df[(df['day'] >= start_dt) & (df['day'] < end_dt)].copy()
 
                 if df.empty:
-                    self.finished_signal.emit(False, "所选时间范围内无新浪分钟数据", None)
+                    self.finished_signal.emit(False, "所选时间范围内无分钟数据", None)
                     return
 
                 dt_series = df['day'].dt.tz_localize('Asia/Shanghai')
@@ -199,7 +207,7 @@ class SinaDataExportThread(QThread):
 
             if self.save_to_file:
                 clean_period = self.period.replace("分钟", "m").replace("小时", "h").replace("天", "d")
-                filename = f"{clean_symbol}_{clean_period}_sina_{self.start_date}_{self.end_date}.csv"
+                filename = f"{clean_symbol}_{clean_period}_sina_{actual_start_date}_{self.end_date}.csv"
                 output_path = os.path.join(self.output_dir, filename)
 
                 export_cols = ['Date', 'Time', 'Open', 'High', 'Low', 'Close', 'Volume']
@@ -228,13 +236,13 @@ class StockExporterUI(QWidget):
     def __init__(self):
         super().__init__()
         self.current_df = None
-        self.is_dark_theme = False  # 默认纯白主题
+        self.is_dark_theme = False
         self.init_ui()
         self.apply_theme()
 
     def init_ui(self):
         self.setWindowTitle("A股历史数据")
-        self.resize(950, 750)
+        self.resize(1020, 750)
 
         layout = QVBoxLayout()
 
@@ -266,19 +274,30 @@ class StockExporterUI(QWidget):
         h_layout2.addWidget(self.adjust_combo)
         layout.addLayout(h_layout2)
 
-        # 3. 起止日期
+        # 3. 起止日期 (快捷选择)
         h_layout3 = QHBoxLayout()
-        today_str = datetime.datetime.now().strftime("%Y%m%d")
+        today = datetime.date.today()
+        today_str = today.strftime("%Y%m%d")
+
         h_layout3.addWidget(QLabel("开始日期:"))
-        self.start_date_input = QLineEdit("20240101")
+
+        self.quick_date_combo = QComboBox()
+        self.quick_date_combo.addItems(["自定义", "近1个月", "近3个月", "近1年", "近3年", "上市至今"])
+        h_layout3.addWidget(self.quick_date_combo)
+
+        self.start_date_input = QLineEdit((today - timedelta(days=365)).strftime("%Y%m%d"))
         h_layout3.addWidget(self.start_date_input)
 
         h_layout3.addWidget(QLabel("结束日期:"))
         self.end_date_input = QLineEdit(today_str)
         h_layout3.addWidget(self.end_date_input)
+
+        self.quick_date_combo.currentIndexChanged.connect(self.on_quick_date_changed)
+        self.start_date_input.textEdited.connect(lambda: self.quick_date_combo.setCurrentText("自定义"))
+
         layout.addLayout(h_layout3)
 
-        # 4. 保存目录 & 操作按钮组
+        # 4. 保存目录 & 操作按钮组 (新增打开文件夹)
         h_layout4 = QHBoxLayout()
         h_layout4.addWidget(QLabel("输出文件夹:"))
         self.dir_input = QLineEdit(os.path.abspath("./export_data"))
@@ -287,6 +306,11 @@ class StockExporterUI(QWidget):
         self.btn_select_dir = QPushButton("选择文件夹")
         self.btn_select_dir.clicked.connect(self.select_directory)
         h_layout4.addWidget(self.btn_select_dir)
+
+        # 新增：打开文件夹按钮
+        self.btn_open_dir = QPushButton("打开文件夹")
+        self.btn_open_dir.clicked.connect(self.open_directory)
+        h_layout4.addWidget(self.btn_open_dir)
 
         self.btn_export_data = QPushButton("导出数据")
         self.btn_export_data.clicked.connect(self.start_export)
@@ -329,8 +353,28 @@ class StockExporterUI(QWidget):
 
         self.setLayout(layout)
 
+    def on_quick_date_changed(self, index):
+        selection = self.quick_date_combo.currentText()
+        if selection == "自定义":
+            return
+
+        today = datetime.date.today()
+
+        if selection == "近1个月":
+            start_dt = today - timedelta(days=30)
+        elif selection == "近3个月":
+            start_dt = today - timedelta(days=90)
+        elif selection == "近1年":
+            start_dt = today - timedelta(days=365)
+        elif selection == "近3年":
+            start_dt = today - timedelta(days=365 * 3)
+        elif selection == "上市至今":
+            self.start_date_input.setText("19900101")
+            return
+
+        self.start_date_input.setText(start_dt.strftime("%Y%m%d"))
+
     def toggle_theme(self):
-        """切换全局主题（纯白 / 科技黑）"""
         self.is_dark_theme = not self.is_dark_theme
         self.btn_theme.setText("☀️" if self.is_dark_theme else "🌙")
         self.apply_theme()
@@ -339,7 +383,6 @@ class StockExporterUI(QWidget):
             self.plot_data(self.current_df)
 
     def apply_theme(self):
-        """应用界面与图表的主题 QSS 与 Color 策略"""
         bg_color = "#121212" if self.is_dark_theme else "#ffffff"
 
         if hasattr(self, 'graphics_layout'):
@@ -388,8 +431,18 @@ class StockExporterUI(QWidget):
         if directory:
             self.dir_input.setText(directory)
 
+    def open_directory(self):
+        """快速打开当前的输出文件夹"""
+        target_dir = self.dir_input.text().strip()
+        if not target_dir:
+            return
+
+        if not os.path.exists(target_dir):
+            os.makedirs(target_dir, exist_ok=True)
+
+        QDesktopServices.openUrl(QUrl.fromLocalFile(target_dir))
+
     def clean_directory(self):
-        """清理目标文件夹下的所有文件和子目录"""
         target_dir = self.dir_input.text().strip()
         if not os.path.exists(target_dir):
             QMessageBox.information(self, "提示", "指定文件夹不存在，无需清理。")
@@ -420,7 +473,6 @@ class StockExporterUI(QWidget):
                 QMessageBox.critical(self, "错误", f"清理文件夹失败: {str(e)}")
 
     def start_export(self):
-        """同时拉取并导出CSV文件"""
         self.start_fetch_data(save_to_file=True)
 
     def start_fetch_data(self, save_to_file=False):
